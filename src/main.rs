@@ -1,46 +1,57 @@
-mod feature_extractor;
-mod pitch_extractor;
-
+use candle_core::{Device, Tensor};
+use candle_onnx;
+use std::collections::HashMap;
+use std::path::Path;
 use std::time::Instant;
-use tract_onnx::prelude::*;
 
 fn main() -> anyhow::Result<()> {
-    println!("--- RVC Rust Inference Components Test ---");
+    println!("--- RVC Rust Performance Test (Anon v2 - Local Fork) ---");
 
-    // 1. 加载音频
-    let wav_path = "assets/test.wav";
-    if !std::path::Path::new(wav_path).exists() {
-        println!("错误: 未找到音频文件 {}。", wav_path);
-        return Ok(());
+    let device = Device::Cpu;
+    let model_path = "models/Anon_v2_merged.onnx";
+
+    if !Path::new(model_path).exists() {
+        anyhow::bail!("Model not found: {}", model_path);
     }
+
+    println!("正在加载模型: {}...", model_path);
+    let start_load = Instant::now();
+    let model_proto = candle_onnx::read_file(model_path)?;
+    println!("模型加载完成，耗时: {:?}", start_load.elapsed());
+
+    // 导出时硬编码了 64 帧
+    let num_frames = 64; 
+    println!("测试输入帧数: {}", num_frames);
+
+    let feats = Tensor::randn(0f32, 1f32, (1, num_frames, 768), &device)?;
+    let p_len = Tensor::from_slice(&[num_frames as i64], (1,), &device)?;
+    let pitch = Tensor::zeros((1, num_frames), candle_core::DType::I64, &device)?;
+    let pitchf = Tensor::zeros((1, num_frames), candle_core::DType::F32, &device)?;
+    let sid = Tensor::from_slice(&[0i64], (1,), &device)?;
+
+    let mut inputs = HashMap::new();
+    inputs.insert("feats".to_string(), feats);
+    inputs.insert("p_len".to_string(), p_len);
+    inputs.insert("pitch".to_string(), pitch);
+    inputs.insert("pitchf".to_string(), pitchf);
+    inputs.insert("sid".to_string(), sid);
+
+    println!("开始推理测试 (Local Fork with Pad Support)...");
+    let start_infer = Instant::now();
     
-    let (waveform, sr) = feature_extractor::load_wav(wav_path)?;
-    println!("音频载入成功，采样率: {}, 总采样点: {}", sr, waveform.len());
-
-    // 预处理: 取前 1 秒
-    let test_samples = if waveform.len() > 16000 {
-        &waveform[..16000]
-    } else {
-        &waveform
-    };
-
-    // 2. ContentVec 特征提取 (通过 Tract 实现纯 Rust 推理)
-    let hubert_path = "pretrain/content_vec_500.onnx";
-    if std::path::Path::new(hubert_path).exists() {
-        println!("正在通过 Tract 加载 ContentVec (Hubert)...");
-        let extractor = feature_extractor::ContentVec::new(hubert_path)?;
-        let start = Instant::now();
-        let features = extractor.extract(test_samples)?;
-        println!("✅ ContentVec 提取成功！耗时: {:?}, 形状: {:?}", start.elapsed(), features.shape());
-        println!("   提示: RVC 实时转换的核心特征提取已跑通。");
+    match candle_onnx::simple_eval(&model_proto, inputs) {
+        Ok(outputs) => {
+            let duration = start_infer.elapsed();
+            println!("✅ 推理成功！");
+            println!("总耗时: {:?}", duration);
+            if let Some(audio) = outputs.get("audio") {
+                println!("输出音频形状: {:?}", audio.shape());
+            }
+        }
+        Err(e) => {
+            println!("❌ 推理失败: {:?}", e);
+        }
     }
 
-    // 3. RMVPE 与 角色模型 状态说明
-    println!("\n--- 待解决的技术挑战 ---");
-    println!("1. RMVPE: 模型期待 [1, 128, T] 输入 (Mel Spectrogram)，需在 Rust 中实现预处理。");
-    println!("2. 角色模型: Candle 暂不支持 Pad constant 算子，Tract 暂不支持 RandomNormalLike。");
-    println!("   后续计划: 手动实现缺失算子或优化 ONNX 模型图。");
-
-    println!("\n--- 组件测试完成 ---");
     Ok(())
 }

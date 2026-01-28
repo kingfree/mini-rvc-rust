@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Hugging Face Candle 核心库
-candle-core = "0.8.4"
-candle-nn = "0.8.4"
-candle-onnx = "0.8.4"
+# Hugging Face Candle 核心库 (Local Fork)
+candle-core = { path = "../candle/candle-core" }
+candle-nn = { path = "../candle/candle-nn" }
+candle-onnx = { path = "../candle/candle-onnx" }
 
 # 基础库
 ndarray = "0.15.6"
@@ -21,3 +21,11 @@ serde_json = "1.0"
 
 # 强制使用 rustls 避开 OpenSSL (C FFI)
 reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json"] }
+
+[[bin]]
+name = "test_contentvec"
+path = "src/test_contentvec.rs"
+
+[[bin]]
+name = "check_ops"
+path = "src/check_ops.rs"
