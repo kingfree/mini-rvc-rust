@@ -1,20 +1,26 @@
-mod audio_processing;
-mod feature_extractor;
-mod pitch_extractor;
-
 use axum::{
     routing::{get, post},
-    extract::Multipart,
+    extract::{Multipart, State, WebSocketUpgrade, ws::{WebSocket, Message}},
     Json, Router,
 };
 use std::net::SocketAddr;
 use tower_http::services::ServeDir;
 use tower_http::cors::CorsLayer;
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 use std::sync::Arc;
 use std::time::Instant;
 use candle_core::{Device, Tensor};
 use tract_onnx::prelude::{* , tvec, Framework};
+use tokio::sync::Mutex;
+
+mod audio_processing;
+mod feature_extractor;
+mod pitch_extractor;
+mod audio_stitching;
+mod realtime_pipeline;
+mod ring_buffer;
+
+use realtime_pipeline::RvcPipeline;
 
 #[derive(Serialize)]
 struct ExtractionResponse {
@@ -22,6 +28,23 @@ struct ExtractionResponse {
     message: String,
     time_ms: u64,
     shape: Vec<usize>,
+}
+
+#[derive(Deserialize)]
+struct WsConfig {
+    pitch_shift: f32,
+    #[serde(default)]
+    model_id: Option<String>,
+}
+
+struct AppState {
+    pipeline: Mutex<Option<RvcPipeline>>,
+}
+
+#[derive(Serialize)]
+struct ModelInfo {
+    id: String,
+    name: String,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -37,18 +60,68 @@ fn main() -> anyhow::Result<()> {
 async fn run_server() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let hubert_path = "pretrain/content_vec_500.onnx";
-    let extractor = if std::path::Path::new(hubert_path).exists() {
-        println!("正在预加载模型: {}...", hubert_path);
-        Some(Arc::new(feature_extractor::ContentVec::new(hubert_path)?))
+    let device = if candle_core::utils::metal_is_available() {
+        println!("🚀 检测到 Metal 加速支持，正在启用 GPU 推理...");
+        Device::new_metal(0)?
     } else {
-        println!("警告: 未找到模型文件 {}, 特征提取功能将不可用。", hubert_path);
+        println!("⚠️ 未检测到 Metal，将使用 CPU 进行推理 (可能会很慢)");
+        Device::Cpu
+    };
+    
+    let content_vec_path = "pretrain/content_vec_500.onnx";
+    let rmvpe_path = "pretrain/rmvpe.onnx";
+    
+    // Default model
+    let rvc_path = "models/Anon_v2_merged.onnx";
+
+    let pipeline = if std::path::Path::new(content_vec_path).exists() && 
+                      std::path::Path::new(rmvpe_path).exists() {
+        
+        let initial_model = if std::path::Path::new(rvc_path).exists() {
+             rvc_path.to_string()
+        } else {
+            // Find first available model
+            if let Ok(mut entries) = std::fs::read_dir("models") {
+                entries.find_map(|entry| {
+                    let path = entry.ok()?.path();
+                    if path.extension()?.to_str()? == "onnx" {
+                        Some(path.to_str()?.to_string())
+                    } else {
+                        None
+                    }
+                }).unwrap_or_else(|| "".to_string())
+            } else {
+                "".to_string()
+            }
+        };
+
+        if !initial_model.is_empty() {
+             println!("正在初始化实时推理管道，使用模型: {}...", initial_model);
+             match RvcPipeline::new(content_vec_path, rmvpe_path, &initial_model, device) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    println!("警告: 管道初始化失败: {}", e);
+                    None
+                }
+            }
+        } else {
+             println!("警告: 未找到任何 RVC 模型文件 (models/*.onnx)。");
+             None
+        }
+    } else {
+        println!("警告: 未找到必要的预训练模型文件 (ContentVec/RMVPE)，实时功能将受限。");
         None
     };
 
+    let state = Arc::new(AppState {
+        pipeline: Mutex::new(pipeline),
+    });
+
     let app = Router::new()
         .route("/api/health", get(|| async { "OK" }))
-        .route("/api/extract", post(move |multipart| handle_extract(extractor, multipart)))
+        .route("/api/models", get(list_models))
+        .route("/ws", get(ws_handler))
+        .with_state(state)
         .fallback_service(ServeDir::new("web/dist"))
         .layer(CorsLayer::permissive());
 
@@ -59,6 +132,115 @@ async fn run_server() -> anyhow::Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+async fn list_models() -> Json<Vec<ModelInfo>> {
+    let mut models = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("models") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(ext) = path.extension() {
+                if ext == "onnx" {
+                    if let Some(stem) = path.file_stem() {
+                        let id = path.file_name().unwrap().to_string_lossy().to_string();
+                        let name = stem.to_string_lossy().to_string();
+                        models.push(ModelInfo { id, name });
+                    }
+                }
+            }
+        }
+    }
+    // Sort for consistency
+    models.sort_by(|a, b| a.name.cmp(&b.name));
+    Json(models)
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+) -> impl axum::response::IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, state))
+}
+
+async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
+    println!("WebSocket 客户端已连接");
+    
+    let mut buffer = ring_buffer::RingBuffer::new(16000 * 5); // 5 seconds buffer
+    let window_size = 16000; // 1 second window for processing
+    let hop_size = 8000;    // 0.5 second hop
+    let mut pitch_shift = 0.0;
+
+    while let Some(Ok(msg)) = socket.recv().await {
+        match msg {
+            Message::Binary(data) => {
+                // Convert bytes (f32 le) to f32 slice
+                let samples: Vec<f32> = data.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
+                
+                buffer.push(&samples);
+
+                // Process if we have enough data
+                while buffer.len() >= window_size {
+                    if let Some(chunk) = buffer.read_and_advance(window_size, hop_size) {
+                        let mut pipeline_guard = state.pipeline.lock().await;
+                        if let Some(ref mut pipeline) = *pipeline_guard {
+                                                            match pipeline.process(&chunk, pitch_shift) {
+                                                            Ok(output) => {
+                                                                if output.is_empty() {
+                                                                    println!("Warning: Output is empty!");
+                                                                } else {
+                                                                    let max_val = output.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+                                                                    if max_val == 0.0 {
+                                                                        println!("Warning: Output is SILENCE (all zeros)!");
+                                                                    } else {
+                                                                        println!("Output chunk: len={}, max_amp={:.4}", output.len(), max_val);
+                                                                    }
+                                                                }
+                            
+                                                                // Convert output f32 to bytes
+                                                                let mut out_bytes = Vec::with_capacity(output.len() * 4);
+                                                                for s in output {
+                                                                    out_bytes.extend_from_slice(&s.to_le_bytes());
+                                                                }
+                                                                if socket.send(Message::Binary(out_bytes)).await.is_err() {
+                                                                    break;
+                                                                }
+                                                            }                                Err(e) => {
+                                    eprintln!("推理错误: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Message::Text(text) => {
+                if let Ok(config) = serde_json::from_str::<WsConfig>(&text) {
+                    pitch_shift = config.pitch_shift;
+                    // Handle Model Switching
+                    if let Some(model_id) = config.model_id {
+                        let model_path = format!("models/{}", model_id);
+                        if std::path::Path::new(&model_path).exists() {
+                            let mut pipeline_guard = state.pipeline.lock().await;
+                            if let Some(ref mut pipeline) = *pipeline_guard {
+                                println!("正在切换模型: {} ...", model_id);
+                                if let Err(e) = pipeline.set_model(&model_path) {
+                                    eprintln!("切换模型失败: {}", e);
+                                } else {
+                                    println!("模型切换成功！");
+                                }
+                            }
+                        } else {
+                            eprintln!("请求的模型不存在: {}", model_path);
+                        }
+                    }
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+    println!("WebSocket 客户端断开连接");
 }
 
 async fn handle_extract(
@@ -181,7 +363,13 @@ fn downsample_f0(f0: &Tensor, target_len: usize) -> anyhow::Result<Tensor> {
 fn run_component_test() -> anyhow::Result<()> {
     // ... (previous code)
     println!("--- RVC Rust Inference Components Test ---");
-    let device = Device::Cpu;
+    let device = if candle_core::utils::metal_is_available() {
+        println!("🚀 检测到 Metal 加速支持，正在启用 GPU 推理 (Test)...");
+        Device::new_metal(0)?
+    } else {
+        println!("⚠️ 未检测到 Metal，将使用 CPU 进行推理 (Test)...");
+        Device::Cpu
+    };
 
     let wav_path = "assets/test.wav";
     if !std::path::Path::new(wav_path).exists() {
@@ -269,9 +457,9 @@ fn run_component_test() -> anyhow::Result<()> {
     }
 
     // 4. 加载角色模型
-    let anon_path = "models/Anon_v2_merged.onnx";
+    let anon_path = "models/Yukina_v2_merged.onnx";
     if std::path::Path::new(anon_path).exists() && features_candle.is_some() && f0_tensor.is_some() {
-        println!("正在加载角色模型 (Anon v2)...");
+        println!("正在加载角色模型 (Yukina v2)...");
         
         // 我们期望的形状是 [1, 64, 768]
         let feats = features_candle.unwrap();

@@ -2,24 +2,26 @@
 name = "mini-rvc-rust"
 version = "0.1.0"
 edition = "2021"
+default-run = "mini-rvc-rust"
 
 [dependencies]
 # Hugging Face Candle 核心库 (Local Fork)
-candle-core = { path = "../candle/candle-core" }
-candle-nn = { path = "../candle/candle-nn" }
+candle-core = { path = "../candle/candle-core", features = ["metal"] }
+candle-nn = { path = "../candle/candle-nn", features = ["metal"] }
 candle-onnx = { path = "../candle/candle-onnx" }
 
 # 基础库
-ndarray = "0.15.6"
+ndarray = "0.16"
 hound = "3.5.1"
 rubato = "0.14.1"
 rustfft = "6.2.0"
 tokio = { version = "1.0", features = ["full"] }
 anyhow = "1.0"
 tract-onnx = "0.21.10"
+tract-data = "0.21.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-axum = { version = "0.7", features = ["multipart"] }
+axum = { version = "0.7", features = ["multipart", "ws"] }
 tower-http = { version = "0.5", features = ["fs", "cors"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
@@ -38,3 +40,7 @@ path = "src/check_ops.rs"
 [[bin]]
 name = "test_mel"
 path = "src/test_mel.rs"
+
+[[bin]]
+name = "test_full"
+path = "src/test_full.rs"
