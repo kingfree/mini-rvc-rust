@@ -1,9 +1,12 @@
 target/
 **/*.onnx
-**/*.py
-**/*.tgz
-**/*.zip
-**/*.pt
+**/*.onnx.data
 **/*.pth
+**/*.pt
+**/*.index
+**/*.pyc
+.venv/
+venv_export/
+*.zip
+*.tgz
 *.so
-*.so.*

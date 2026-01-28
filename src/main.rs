@@ -1,50 +1,45 @@
-use candle_core::Device;
-use candle_onnx;
-use std::path::Path;
+mod feature_extractor;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    println!("--- Mini RVC Rust Inference (via Hugging Face Candle) ---");
-    println!("目标：100% 纯 Rust，无 C FFI 依赖");
+use std::time::Instant;
 
-    // 1. 选择设备
-    let device = Device::Cpu;
-    println!("当前推理设备: {:?}", device);
+fn main() -> anyhow::Result<()> {
+    println!("--- RVC Feature Extraction Test (ContentVec) ---");
 
-    // 2. 模型路径
-    let model_path = "/home/mei/dev/voice-changer/server/model_dir/0/tsukuyomi_v2_40k_e100_simple.onnx";
-
-    if Path::new(model_path).exists() {
-        println!("正在尝试加载 ONNX 模型: {}", model_path);
-        
-        match candle_onnx::read_file(model_path) {
-            Ok(model_proto) => {
-                println!("✅ 成功读取模型协议！");
-                
-                let graph = model_proto.graph.as_ref().unwrap();
-                println!("模型图名称: {}", graph.name);
-                println!("节点数量: {}", graph.node.len());
-
-                // 尝试提取输入输出名称
-                let inputs: Vec<_> = graph.input.iter().map(|i| &i.name).collect();
-                let outputs: Vec<_> = graph.output.iter().map(|o| &o.name).collect();
-
-                println!("输入节点: {:?}", inputs);
-                println!("输出节点: {:?}", outputs);
-
-                // 3. 构建简单的计算图进行验证
-                println!("正在验证模型结构...");
-                // 仅验证是否能成功载入权重
-                let _model = candle_onnx::simple_eval(&model_proto, std::collections::HashMap::new());
-                println!("✅ 模型结构验证通过 (基本载入测试)");
-            },
-            Err(e) => {
-                println!("❌ 模型解析失败: {:?}", e);
-            }
-        }
-    } else {
-        println!("❌ 未找到模型文件 '{}'。", model_path);
+    // 1. 加载音频
+    let wav_path = "assets/test.wav";
+    if !std::path::Path::new(wav_path).exists() {
+        println!("警告: 未找到音频文件 {}, 将跳过实际提取测试。", wav_path);
+        return Ok(());
     }
+    
+    let (waveform, sr) = feature_extractor::load_wav(wav_path)?;
+    println!("音频载入成功，采样率: {}, 采样点数: {}", sr, waveform.len());
+
+    // 2. 加载模型
+    let model_path = "pretrain/content_vec_500.onnx";
+    if !std::path::Path::new(model_path).exists() {
+        println!("警告: 未找到模型文件 {}, 将跳过实际提取测试。", model_path);
+        return Ok(());
+    }
+
+    println!("正在通过 Tract 加载 ContentVec 模型: {}...", model_path);
+    let start_load = Instant::now();
+    let extractor = feature_extractor::ContentVec::new(model_path)?;
+    println!("模型加载成功，耗时: {:?}", start_load.elapsed());
+
+    // 3. 执行提取
+    println!("开始提取特征...");
+    let start_extract = Instant::now();
+    // 取前 1 秒进行测试
+    let test_samples = if waveform.len() > 16000 {
+        &waveform[..16000]
+    } else {
+        &waveform
+    };
+    
+    let features = extractor.extract(test_samples)?;
+    println!("特征提取成功！耗时: {:?}", start_extract.elapsed());
+    println!("特征形状: {:?}", features.shape());
 
     Ok(())
 }
