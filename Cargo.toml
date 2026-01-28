@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Burn 核心框架
-burn = { version = "0.16.0", features = ["train", "wgpu"] }
-# 纯 Rust ONNX 导入工具
-burn-import = "0.16.0"
+# Hugging Face Candle 核心库
+candle-core = "0.8.4"
+candle-nn = "0.8.4"
+candle-onnx = "0.8.4"
 
 # 基础库
 ndarray = "0.15.6"
@@ -18,6 +18,3 @@ anyhow = "1.0"
 
 # 强制使用 rustls 避开 OpenSSL (C FFI)
 reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json"] }
-
-[build-dependencies]
-burn-import = "0.16.0"
