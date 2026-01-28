@@ -10,8 +10,8 @@ use rubato::{Resampler, FftFixedIn};
 
 pub struct RvcPipeline {
     content_vec: ContentVec,
-    // RMVPE using Tract (InferenceModel to avoid optimization issues with dynamic shapes)
-    rmvpe: InferenceModel,
+    // RMVPE using Tract
+    rmvpe: RunnableModel<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>,
     mel_extractor: MelSpectrogram,
     // RVC Model (Candle)
     rvc_model_proto: candle_onnx::onnx::ModelProto,
@@ -35,12 +35,16 @@ impl RvcPipeline {
             .context("Failed to load ContentVec model")?;
 
         // 2. Load RMVPE (Tract)
-        // Use InferenceModel (SimplePlan with InferenceFact) to handle dynamic shapes gracefully
-        // without forcing typed optimization which was failing on dimension inference.
+        // RMVPE expects 128 mel bins.
+        // We use concrete input length (128 frames) because tract symbolic inference
+        // fails on this model's complex U-Net structure (output mismatch) if dynamic.
         let rmvpe = tract_onnx::onnx()
             .model_for_path(rmvpe_path.as_ref())?
+            .with_input_fact(0, f32::fact([1, 128, 128]).into())?
+            .into_optimized()?
             .into_runnable()?;
             
+        // Use 128 mels!
         let mel_extractor = MelSpectrogram::new(16000, 1024, 160, 1024, 128);
 
         // 3. Load RVC Model (Candle)
@@ -48,6 +52,7 @@ impl RvcPipeline {
             .context("Failed to load RVC model")?;
 
         // 4. Stitcher
+        // Fade length: e.g. 20ms at 16kHz = 320 samples.
         let stitcher = CrossFadeStitcher::new(320);
 
         Ok(Self {
@@ -57,8 +62,8 @@ impl RvcPipeline {
             rvc_model_proto,
             stitcher,
             device,
-            model_sr: 40000, 
-            output_sr: 16000, 
+            model_sr: 40000, // Detected from Yukina_v2
+            output_sr: 16000, // Match frontend for now
         })
     }
 
@@ -71,26 +76,31 @@ impl RvcPipeline {
     }
 
     pub fn process(&mut self, audio: &[f32], pitch_shift: f32) -> Result<Vec<f32>> {
-        // ... (rest of process implementation is same, just using rmvpe inference plan)
         // 1. Extract Features (ContentVec)
         let features = self.content_vec.extract(audio)?;
         let (_b, t, d) = (features.shape()[0], features.shape()[1], features.shape()[2]);
+        println!("Features shape: {:?}", features.shape());
         
         // 2. Extract Pitch (RMVPE)
         let mel = self.mel_extractor.forward(audio)?;
+        println!("Mel shape: {:?}", mel.dim());
         let (n_mels, n_frames) = mel.dim();
+        
         let mel_flat: Vec<f32> = mel.iter().cloned().collect();
         let mel_tract = tract_onnx::prelude::Tensor::from_shape(&[1, n_mels, n_frames], &mel_flat)?;
         
         let rmvpe_out = self.rmvpe.run(tvec!(mel_tract.into()))?;
         let f0_probs = rmvpe_out[0].to_array_view::<f32>()?;
+        println!("F0 Probs shape: {:?}", f0_probs.shape());
         let f0 = self.post_process_f0(f0_probs)?;
         let f0_shifted = f0.mapv(|f| if f > 0.0 { f * 2.0f32.powf(pitch_shift / 12.0) } else { 0.0 });
 
         // 3. Interpolate Features
         let target_len = f0_shifted.len();
+        println!("Target len (F0): {}", target_len);
         let feats_data = features.as_slice::<f32>()?;
         let feats_interpolated = self.interpolate_features(feats_data, t, d, target_len)?;
+        println!("Feats interpolated len: {}", feats_interpolated.len() / d);
         
         // 4. Prepare inputs
         let feats_tensor = Tensor::from_vec(feats_interpolated, (1, target_len, d), &self.device)?;

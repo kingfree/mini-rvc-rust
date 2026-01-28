@@ -10,3 +10,4 @@ venv_export/
 *.zip
 *.tgz
 *.so
+assets/output.wav

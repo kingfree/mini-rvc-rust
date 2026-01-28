@@ -33,11 +33,11 @@ def export_yukina():
     net_g_onnx.eval()
     
     # Dummy inputs for RVC v2
-    # feats: [1, 64, 768]
-    feats = torch.randn(1, 64, 768)
-    p_len = torch.LongTensor([64])
-    pitch = torch.zeros(1, 64, dtype=torch.long)
-    pitchf = torch.zeros(1, 64, dtype=torch.float)
+    # feats: [1, 128, 768] (Matching our streaming chunk size)
+    feats = torch.randn(1, 128, 768)
+    p_len = torch.LongTensor([128])
+    pitch = torch.zeros(1, 128, dtype=torch.long)
+    pitchf = torch.zeros(1, 128, dtype=torch.float)
     sid = torch.LongTensor([0])
     
     print(f"Exporting to {output_path} with opset 17...")
