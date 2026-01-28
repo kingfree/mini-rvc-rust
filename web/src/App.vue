@@ -49,7 +49,7 @@
           </button>
         </div>
         <div v-if="isRealtime" class="status">
-          <span class="pulse"></span> 魔法持续生效中...
+          <span class="pulse"></span> 魔法持续生效中... <span style="margin-left: 10px; font-size: 0.9em; color: #666;">延迟: {{ latency }} ms</span>
         </div>
       </section>
     </main>
@@ -68,6 +68,7 @@ const isRealtime = ref(false)
 const pitchShift = ref(0)
 const models = ref<{id: string, name: string}[]>([])
 const selectedModel = ref<string>('')
+const latency = ref(0)
 
 let audioContext: AudioContext | null = null
 let ws: WebSocket | null = null
@@ -203,6 +204,15 @@ const toggleRealtime = async () => {
           type: 'audio-output',
           samples: samples
         })
+      } else if (typeof event.data === 'string') {
+        try {
+          const meta = JSON.parse(event.data)
+          if (meta.latency !== undefined) {
+            latency.value = meta.latency
+          }
+        } catch (e) {
+          // ignore
+        }
       }
     }
 

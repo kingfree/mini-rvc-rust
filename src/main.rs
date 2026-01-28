@@ -289,6 +289,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 if sender.send(Message::Binary(out_bytes)).await.is_err() {
                     break;
                 }
+                
+                // Send metadata (latency)
+                let meta = serde_json::json!({
+                    "latency": result.latency,
+                    "len": output.len()
+                });
+                if sender.send(Message::Text(meta.to_string())).await.is_err() {
+                    break;
+                }
             }
         }
     });
