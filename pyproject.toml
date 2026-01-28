@@ -1,0 +1,13 @@
+[project]
+name = "mini-rvc-rust"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "librosa>=0.11.0",
+    "numpy>=2.3.5",
+    "onnx>=1.20.1",
+    "onnxscript>=0.5.7",
+    "torch>=2.10.0",
+]
