@@ -36,11 +36,14 @@ struct WsConfig {
     pitch_shift: f32,
     #[serde(default)]
     model_id: Option<String>,
+    #[serde(default)]
+    index_rate: f32,
 }
 
 struct InferenceRequest {
     audio_chunk: Vec<f32>,
     pitch_shift: f32,
+    index_rate: f32,
     hop_size: usize,
     timestamp: Instant,
     sender: Sender<InferenceResult>,
@@ -86,12 +89,15 @@ async fn run_server() -> anyhow::Result<()> {
     let content_vec_path = "pretrain/content_vec_500.onnx";
     let rmvpe_path = "pretrain/rmvpe.onnx";
     let rvc_path = "models/Yukina_v2_merged.onnx"; 
+    // We assume index file is named similarly or specified. 
+    // For simplicity, let's look for "models/Yukina_v2_index.safetensors"
+    let index_path = "models/Yukina_v2_index.safetensors";
 
     // Channels for inference worker
     let (tx, mut rx) = mpsc::channel::<InferenceRequest>(100);
     let (model_path_tx, mut model_path_rx) = mpsc::channel::<String>(10);
 
-    // Spawn Inference Worker in a dedicated thread (OS thread) to avoid blocking async runtime
+    // Spawn Inference Worker
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -116,9 +122,29 @@ async fn run_server() -> anyhow::Result<()> {
                     }
                 };
 
+                // Check for corresponding index file
+                let initial_index = if !initial_model.is_empty() {
+                    let p = std::path::Path::new(&initial_model);
+                    let stem = p.file_stem().unwrap().to_str().unwrap();
+                    // Clean "_merged" suffix if present
+                    let base_name = stem.replace("_merged", "");
+                    let idx_path = format!("models/{}_index.safetensors", base_name);
+                    if std::path::Path::new(&idx_path).exists() {
+                        Some(idx_path)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 if !initial_model.is_empty() {
                      println!("正在初始化实时推理管道，使用模型: {}...", initial_model);
-                     match RvcPipeline::new(content_vec_path, rmvpe_path, &initial_model, device) {
+                     if let Some(ref idx) = initial_index {
+                         println!("  加载索引: {}", idx);
+                     }
+                     
+                     match RvcPipeline::new(content_vec_path, rmvpe_path, &initial_model, initial_index.as_ref(), device.clone()) {
                         Ok(p) => Some(p),
                         Err(e) => {
                             println!("警告: 管道初始化失败: {}", e);
@@ -139,16 +165,10 @@ async fn run_server() -> anyhow::Result<()> {
                     Some(req) = rx.recv() => {
                         if let Some(p) = &mut pipeline {
                             // Process inference
-                            match p.process(&req.audio_chunk, req.hop_size, req.pitch_shift) {
+                            match p.process(&req.audio_chunk, req.hop_size, req.pitch_shift, req.index_rate) {
                                 Ok(output) => {
                                     let total_latency = req.timestamp.elapsed().as_millis();
                                     
-                                    // Debug output
-                                    let max_val = output.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-                                    if max_val > 0.0 {
-                                        // println!("Processed chunk: {} samples, max_amp={:.4}, latency={}ms", output.len(), max_val, total_latency);
-                                    }
-
                                     if total_latency > 500 {
                                         println!("⚠️ 高延迟警告: 总延迟 {}ms", total_latency);
                                     }
@@ -171,6 +191,13 @@ async fn run_server() -> anyhow::Result<()> {
                             if let Err(e) = p.set_model(&new_model_path) {
                                 eprintln!("Worker: Failed to switch model: {}", e);
                             } else {
+                                // Try to find and load new index
+                                let path = std::path::Path::new(&new_model_path);
+                                if let Some(stem) = path.file_stem() {
+                                    let base_name = stem.to_str().unwrap().replace("_merged", "");
+                                    let idx_path = format!("models/{}_index.safetensors", base_name);
+                                    let _ = p.set_index(&idx_path); // Ignore error if index missing
+                                }
                                 println!("Worker: Model switched successfully.");
                             }
                         }
@@ -242,10 +269,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (mut sender, mut receiver) = socket.split();
     
     let mut buffer = ring_buffer::RingBuffer::new(16000 * 5); 
-    // Low latency settings
-    let window_size = 6400; // 400ms
-    let hop_size = 4800;    // 300ms
+    let window_size = 6400; 
+    let hop_size = 4800;    
     let mut pitch_shift = 0.0;
+    let mut index_rate = 0.3; // Default index rate
 
     // Response channel
     let (resp_tx, mut resp_rx) = mpsc::channel::<InferenceResult>(20);
@@ -280,6 +307,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         let req = InferenceRequest {
                             audio_chunk: chunk,
                             pitch_shift,
+                            index_rate,
                             hop_size,
                             timestamp: Instant::now(),
                             sender: resp_tx.clone(),
@@ -294,6 +322,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             Message::Text(text) => {
                 if let Ok(config) = serde_json::from_str::<WsConfig>(&text) {
                     pitch_shift = config.pitch_shift;
+                    index_rate = config.index_rate; // Update index rate
+                    
                     if let Some(model_id) = config.model_id {
                         let model_path = format!("models/{}", model_id);
                         if std::path::Path::new(&model_path).exists() {
@@ -378,12 +408,9 @@ fn downsample_f0(f0: &Tensor, target_len: usize) -> anyhow::Result<Tensor> {
 }
 
 fn post_process_rmvpe(f0_probs: &Tensor) -> anyhow::Result<Tensor> {
-    // f0_probs: [1, n_frames, 360]
     let (n_batch, n_frames, n_bins) = f0_probs.dims3()?;
-    
     let argmax = f0_probs.argmax(2)?; 
     let argmax_data = argmax.to_vec2::<u32>()?;
-    
     let mut f0_values = Vec::with_capacity(n_batch * n_frames);
     for batch in argmax_data {
         for bin in batch {
@@ -392,7 +419,6 @@ fn post_process_rmvpe(f0_probs: &Tensor) -> anyhow::Result<Tensor> {
             f0_values.push(f0);
         }
     }
-    
     Tensor::from_vec(f0_values, (n_batch, n_frames), f0_probs.device()).map_err(anyhow::Error::from)
 }
 

@@ -1639,7 +1639,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
- "tract-data",
  "tract-onnx",
 ]
 

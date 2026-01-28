@@ -24,8 +24,9 @@ fn main() -> anyhow::Result<()> {
     let content_vec_path = "pretrain/content_vec_500.onnx";
     let rmvpe_path = "pretrain/rmvpe.onnx";
     let rvc_path = "models/Yukina_v2_merged.onnx";
+    let index_path = Some("models/Yukina_v2_index.safetensors");
 
-    let mut pipeline = RvcPipeline::new(content_vec_path, rmvpe_path, rvc_path, device)?;
+    let mut pipeline = RvcPipeline::new(content_vec_path, rmvpe_path, rvc_path, index_path, device)?;
 
     let input_path = "assets/test.wav";
     let output_path = "assets/output.wav";
@@ -57,7 +58,7 @@ fn main() -> anyhow::Result<()> {
         let chunk = &samples_16k[start..end];
         
         println!("Processing chunk {}-{}...", start, end);
-        let out_chunk = pipeline.process(chunk, hop_size, 0.0)?; // Pitch shift 0
+        let out_chunk = pipeline.process(chunk, hop_size, 0.0, 0.3)?; // Pitch shift 0, Index rate 0.3
         
         // Log stats
         let max_val = out_chunk.iter().fold(0.0f32, |a, &b| a.max(b.abs()));

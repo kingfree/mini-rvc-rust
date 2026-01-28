@@ -10,11 +10,13 @@ use rubato::{Resampler, FftFixedIn};
 
 pub struct RvcPipeline {
     content_vec: ContentVec,
-    // RMVPE using Tract
+    // RMVPE using Tract (TypedModel)
     rmvpe: RunnableModel<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>,
     mel_extractor: MelSpectrogram,
     // RVC Model (Candle)
     rvc_model_proto: candle_onnx::onnx::ModelProto,
+    // Index Tensor
+    index_tensor: Option<Tensor>,
     
     stitcher: CrossFadeStitcher,
     device: Device,
@@ -28,6 +30,7 @@ impl RvcPipeline {
         content_vec_path: impl AsRef<Path>,
         rmvpe_path: impl AsRef<Path>,
         rvc_path: impl AsRef<Path>,
+        index_path: Option<impl AsRef<Path>>,
         device: Device,
     ) -> Result<Self> {
         // 1. Load ContentVec
@@ -51,8 +54,20 @@ impl RvcPipeline {
         let rvc_model_proto = candle_onnx::read_file(rvc_path.as_ref())
             .context("Failed to load RVC model")?;
 
-        // 4. Stitcher
-        // Fade length: e.g. 20ms at 16kHz = 320 samples.
+        // 4. Load Index
+        let index_tensor = if let Some(p) = index_path {
+            if p.as_ref().exists() {
+                println!("Loading index from {:?}", p.as_ref());
+                let tensors = candle_core::safetensors::load(p.as_ref(), &device)?;
+                tensors.get("vectors").cloned()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // 5. Stitcher
         let stitcher = CrossFadeStitcher::new(320);
 
         Ok(Self {
@@ -60,10 +75,11 @@ impl RvcPipeline {
             rmvpe,
             mel_extractor,
             rvc_model_proto,
+            index_tensor,
             stitcher,
             device,
-            model_sr: 40000, // Detected from Yukina_v2
-            output_sr: 16000, // Match frontend for now
+            model_sr: 40000,
+            output_sr: 16000,
         })
     }
 
@@ -75,7 +91,16 @@ impl RvcPipeline {
         Ok(())
     }
 
-    pub fn process(&mut self, audio: &[f32], input_hop_size: usize, pitch_shift: f32) -> Result<Vec<f32>> {
+    pub fn set_index(&mut self, index_path: impl AsRef<Path>) -> Result<()> {
+        if index_path.as_ref().exists() {
+            println!("Loading index from {:?}", index_path.as_ref());
+            let tensors = candle_core::safetensors::load(index_path.as_ref(), &self.device)?;
+            self.index_tensor = tensors.get("vectors").cloned();
+        }
+        Ok(())
+    }
+
+    pub fn process(&mut self, audio: &[f32], input_hop_size: usize, pitch_shift: f32, index_rate: f32) -> Result<Vec<f32>> {
         // 1. Extract Features (ContentVec)
         let features = self.content_vec.extract(audio)?;
         let (_b, t, d) = (features.shape()[0], features.shape()[1], features.shape()[2]);
@@ -98,7 +123,27 @@ impl RvcPipeline {
         let feats_interpolated = self.interpolate_features(feats_data, t, d, target_len)?;
         
         // 4. Prepare inputs
-        let feats_tensor = Tensor::from_vec(feats_interpolated, (1, target_len, d), &self.device)?;
+        let mut feats_tensor = Tensor::from_vec(feats_interpolated, (1, target_len, d), &self.device)?;
+        
+        // 4.5 Apply Index
+        if let Some(index) = &self.index_tensor {
+            if index_rate > 0.0 {
+                let query = feats_tensor.squeeze(0)?;
+                let query_sq = query.sqr()?.sum_keepdim(1)?;
+                let index_sq = index.sqr()?.sum_keepdim(1)?.t()?;
+                let xy = query.matmul(&index.t()?)?;
+                let dist = query_sq.broadcast_add(&index_sq)?
+                    .broadcast_sub(&xy.broadcast_mul(&Tensor::new(2.0f32, &self.device)?)?)?;
+                let nearest_idx = dist.argmin(1)?;
+                let nearest = index.index_select(&nearest_idx, 0)?;
+                let ratio = Tensor::new(index_rate, &self.device)?;
+                let one_minus_ratio = Tensor::new(1.0 - index_rate, &self.device)?;
+                let mixed = query.broadcast_mul(&one_minus_ratio)?
+                    .broadcast_add(&nearest.broadcast_mul(&ratio)?)?;
+                feats_tensor = mixed.unsqueeze(0)?;
+            }
+        }
+
         let f0_vec = f0_shifted.to_vec();
         let pitch_indices: Vec<i64> = f0_vec.iter().map(|&f| {
              if f > 0.0 {
@@ -126,26 +171,24 @@ impl RvcPipeline {
         let audio_out = outputs.get("audio").context("Model output 'audio' not found")?;
         let mut audio_data = audio_out.flatten_all()?.to_vec1::<f32>()?;
 
-        // 6. Resample FIRST to match target rate (16k) so we can crop by samples reliably
-        let resampled = if self.model_sr != self.output_sr {
-            self.resample(&audio_data, self.model_sr, self.output_sr)?
+        // 6. Streaming Crop
+        let out_len = audio_data.len();
+        let keep_len = input_hop_size.min(out_len);
+        let cropped = if out_len > keep_len {
+            audio_data[out_len - keep_len..].to_vec()
         } else {
             audio_data
         };
-
-        // 7. Streaming Crop
-        // input_hop_size is in 16k samples. resampled is 16k.
-        // We want to keep the LAST input_hop_size samples.
-        let out_len = resampled.len();
-        let keep_len = input_hop_size.min(out_len);
-        let cropped = if out_len > keep_len {
-            resampled[out_len - keep_len..].to_vec()
+        
+        // 7. Resample to output_sr (16k)
+        let resampled = if self.model_sr != self.output_sr {
+            self.resample(&cropped, self.model_sr, self.output_sr)?
         } else {
-            resampled
+            cropped
         };
         
         // 8. Stitching
-        let stitched = self.stitcher.process(cropped);
+        let stitched = self.stitcher.process(resampled);
         
         Ok(stitched)
     }
