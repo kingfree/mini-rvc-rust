@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Hugging Face Candle 核心库 (Remote Fork)
-candle-core = { git = "https://github.com/kingfree/candle.git", branch = "feat-onnx-ops-for-rvc", package = "candle-core" }
-candle-nn = { git = "https://github.com/kingfree/candle.git", branch = "feat-onnx-ops-for-rvc", package = "candle-nn" }
-candle-onnx = { git = "https://github.com/kingfree/candle.git", branch = "feat-onnx-ops-for-rvc", package = "candle-onnx" }
+# Hugging Face Candle 核心库 (Local Fork)
+candle-core = { path = "../candle/candle-core" }
+candle-nn = { path = "../candle/candle-nn" }
+candle-onnx = { path = "../candle/candle-onnx" }
 
 # 基础库
 ndarray = "0.15.6"
@@ -19,6 +19,10 @@ anyhow = "1.0"
 tract-onnx = "0.21.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+axum = { version = "0.7", features = ["multipart"] }
+tower-http = { version = "0.5", features = ["fs", "cors"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
 
 # 强制使用 rustls 避开 OpenSSL (C FFI)
 reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json"] }
@@ -30,3 +34,7 @@ path = "src/test_contentvec.rs"
 [[bin]]
 name = "check_ops"
 path = "src/check_ops.rs"
+
+[[bin]]
+name = "test_mel"
+path = "src/test_mel.rs"

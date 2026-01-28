@@ -1,4 +1,4 @@
-use ndarray::{Array1, Array2, Axis};
+use ndarray::{Array1, Array2};
 use rustfft::{FftPlanner, num_complex::Complex};
 use std::f32::consts::PI;
 use std::fs::File;
@@ -25,7 +25,6 @@ impl MelSpectrogram {
             0.5 * (1.0 - (2.0 * PI * i as f32 / (win_length - 1) as f32).cos())
         }));
 
-        // Load pre-generated mel filterbank
         let mut mel_filterbank = Array2::zeros((n_mels, n_fft / 2 + 1));
         if let Ok(mut file) = File::open("assets/mel_filterbank.bin") {
             let mut buffer = Vec::new();
@@ -50,52 +49,69 @@ impl MelSpectrogram {
         }
     }
 
-    pub fn forward(&self, audio: &[f32]) -> anyhow::Result<Array2<f32>> {
-        // Ensure audio length is sufficient
-        if audio.len() < self.win_length {
-            return Ok(Array2::zeros((self.n_mels, 1)));
+    fn reflect_pad(audio: &[f32], pad: usize) -> Vec<f32> {
+        let n = audio.len();
+        let mut padded = vec![0.0; n + 2 * pad];
+        for i in 0..pad {
+            padded[pad - 1 - i] = audio[i + 1];
+            padded[n + pad + i] = audio[n - 2 - i];
         }
+        padded[pad..pad + n].copy_from_slice(audio);
+        padded
+    }
+
+    pub fn forward(&self, audio: &[f32]) -> anyhow::Result<Array2<f32>> {
+        let pad = self.n_fft / 2;
+        let padded_audio = Self::reflect_pad(audio, pad);
         
-        let n_frames = (audio.len() - self.win_length) / self.hop_length + 1;
-        // RMVPE UNet downsamples 4 times (2^4 = 16), so frames should be multiple of 16
-        let n_frames_padded = (n_frames + 15) / 16 * 16;
-        
-        let mut power_spec = Array2::zeros((n_frames_padded, self.n_fft / 2 + 1));
+        let n_frames = (padded_audio.len() - self.n_fft) / self.hop_length + 1;
+        let mut power_spec = Array2::zeros((n_frames, self.n_fft / 2 + 1));
 
         let mut planner = FftPlanner::new();
         let fft = planner.plan_fft_forward(self.n_fft);
 
         for i in 0..n_frames {
             let start = i * self.hop_length;
-            let end = (start + self.win_length).min(audio.len());
-            let frame = &audio[start..end];
+            let frame = &padded_audio[start..start + self.win_length];
 
-            let mut buffer: Vec<Complex<f32>> = frame
-                .iter()
-                .zip(self.window.iter())
-                .map(|(&x, &w)| Complex::new(x * w, 0.0))
-                .collect();
-            
-            if buffer.len() < self.n_fft {
-                buffer.resize(self.n_fft, Complex::new(0.0, 0.0));
+            let mut buffer = vec![Complex::new(0.0, 0.0); self.n_fft];
+            for (j, (&x, &w)) in frame.iter().zip(self.window.iter()).enumerate() {
+                buffer[j] = Complex::new(x * w, 0.0);
             }
 
             fft.process(&mut buffer);
 
+            if i < 2 {
+                // println!("Rust Frame {} Power[0]: {}", i, buffer[0].norm_sqr() / 4.0);
+            }
+
             for j in 0..(self.n_fft / 2 + 1) {
-                power_spec[[i, j]] = buffer[j].norm_sqr();
+                power_spec[[i, j]] = buffer[j].norm_sqr() / 4.0;
             }
         }
-        
-        // Padded frames remain zero
 
-        // Apply mel filterbank: [n_mels, n_fft/2+1] * [n_frames, n_fft/2+1].T -> [n_mels, n_frames]
+        // Apply mel filterbank
         let mel_spec = self.mel_filterbank.dot(&power_spec.reversed_axes());
         
-        // Log-mel
-        let log_mel_spec = mel_spec.mapv(|x| (x.max(1e-10)).log10());
+        // Log-mel scaling
+        let mel_db = mel_spec.mapv(|x| 10.0 * (x.max(1e-10)).log10());
         
-        Ok(log_mel_spec)
+        // RVC scaling: (db + 20) / 20
+        let mel_scaled = mel_db.mapv(|x| (x + 20.0) / 20.0);
+        
+        // RMVPE UNet Requirement: Width (time) should be multiple of 128
+        let (n_mels, n_frames) = mel_scaled.dim();
+        let n_frames_padded = (n_frames + 127) / 128 * 128;
+        
+        if n_frames_padded > n_frames {
+            let mut padded = Array2::zeros((n_mels, n_frames_padded));
+            padded.slice_mut(ndarray::s![.., 0..n_frames]).assign(&mel_scaled);
+            // Constant pad with -5.0 (silence in scaled log-mel)
+            padded.slice_mut(ndarray::s![.., n_frames..]).fill(-5.0);
+            return Ok(padded);
+        }
+        
+        Ok(mel_scaled)
     }
 }
 
