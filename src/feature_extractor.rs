@@ -9,9 +9,9 @@ pub struct ContentVec {
 
 impl ContentVec {
     pub fn new(model_path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        // 不强制指定 shape，让 tract 自动处理动态维度
         let model = tract_onnx::onnx()
             .model_for_path(model_path)?
-            .with_input_fact(0, f32::fact(&[1, 16000]).into())? 
             .into_optimized()?
             .into_runnable()?;
         Ok(Self { model })
@@ -19,6 +19,7 @@ impl ContentVec {
 
     pub fn extract(&self, waveform: &[f32]) -> anyhow::Result<Arc<Tensor>> {
         let len = waveform.len();
+        // 输入形状应该是 [1, T]
         let input = Tensor::from_shape(&[1, len], waveform)?;
         let mut outputs = self.model.run(tvec!(input.into()))?;
         let result = outputs.remove(0).into_tensor();
