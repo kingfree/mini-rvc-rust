@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Hugging Face Candle 核心库 (Local Fork)
-candle-core = { path = "../candle/candle-core" }
-candle-nn = { path = "../candle/candle-nn" }
-candle-onnx = { path = "../candle/candle-onnx" }
+# Hugging Face Candle 核心库 (Remote Fork)
+candle-core = { git = "https://github.com/kingfree/candle.git", branch = "feat-onnx-ops-for-rvc", package = "candle-core" }
+candle-nn = { git = "https://github.com/kingfree/candle.git", branch = "feat-onnx-ops-for-rvc", package = "candle-nn" }
+candle-onnx = { git = "https://github.com/kingfree/candle.git", branch = "feat-onnx-ops-for-rvc", package = "candle-onnx" }
 
 # 基础库
 ndarray = "0.15.6"
