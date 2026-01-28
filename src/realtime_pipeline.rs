@@ -75,15 +75,13 @@ impl RvcPipeline {
         Ok(())
     }
 
-    pub fn process(&mut self, audio: &[f32], pitch_shift: f32) -> Result<Vec<f32>> {
+    pub fn process(&mut self, audio: &[f32], input_hop_size: usize, pitch_shift: f32) -> Result<Vec<f32>> {
         // 1. Extract Features (ContentVec)
         let features = self.content_vec.extract(audio)?;
         let (_b, t, d) = (features.shape()[0], features.shape()[1], features.shape()[2]);
-        println!("Features shape: {:?}", features.shape());
         
         // 2. Extract Pitch (RMVPE)
         let mel = self.mel_extractor.forward(audio)?;
-        println!("Mel shape: {:?}", mel.dim());
         let (n_mels, n_frames) = mel.dim();
         
         let mel_flat: Vec<f32> = mel.iter().cloned().collect();
@@ -91,16 +89,13 @@ impl RvcPipeline {
         
         let rmvpe_out = self.rmvpe.run(tvec!(mel_tract.into()))?;
         let f0_probs = rmvpe_out[0].to_array_view::<f32>()?;
-        println!("F0 Probs shape: {:?}", f0_probs.shape());
         let f0 = self.post_process_f0(f0_probs)?;
         let f0_shifted = f0.mapv(|f| if f > 0.0 { f * 2.0f32.powf(pitch_shift / 12.0) } else { 0.0 });
 
         // 3. Interpolate Features
         let target_len = f0_shifted.len();
-        println!("Target len (F0): {}", target_len);
         let feats_data = features.as_slice::<f32>()?;
         let feats_interpolated = self.interpolate_features(feats_data, t, d, target_len)?;
-        println!("Feats interpolated len: {}", feats_interpolated.len() / d);
         
         // 4. Prepare inputs
         let feats_tensor = Tensor::from_vec(feats_interpolated, (1, target_len, d), &self.device)?;
@@ -131,22 +126,26 @@ impl RvcPipeline {
         let audio_out = outputs.get("audio").context("Model output 'audio' not found")?;
         let mut audio_data = audio_out.flatten_all()?.to_vec1::<f32>()?;
 
-        // 6. Streaming Crop
-        let out_len = audio_data.len();
-        let keep_len = out_len / 2; 
-        if out_len > keep_len {
-            audio_data = audio_data.split_off(out_len - keep_len);
-        }
-
-        // 7. Resample to output_sr (16k)
+        // 6. Resample FIRST to match target rate (16k) so we can crop by samples reliably
         let resampled = if self.model_sr != self.output_sr {
             self.resample(&audio_data, self.model_sr, self.output_sr)?
         } else {
             audio_data
         };
+
+        // 7. Streaming Crop
+        // input_hop_size is in 16k samples. resampled is 16k.
+        // We want to keep the LAST input_hop_size samples.
+        let out_len = resampled.len();
+        let keep_len = input_hop_size.min(out_len);
+        let cropped = if out_len > keep_len {
+            resampled[out_len - keep_len..].to_vec()
+        } else {
+            resampled
+        };
         
         // 8. Stitching
-        let stitched = self.stitcher.process(resampled);
+        let stitched = self.stitcher.process(cropped);
         
         Ok(stitched)
     }

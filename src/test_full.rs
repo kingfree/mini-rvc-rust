@@ -49,12 +49,15 @@ fn main() -> anyhow::Result<()> {
     let mut output_audio = Vec::new();
 
     let mut start = 0;
-    while start + chunk_size < samples_16k.len() {
+    // Process only first 2 seconds (32000 samples) for speed
+    let limit_samples = 32000.min(samples_16k.len());
+    
+    while start + chunk_size < limit_samples {
         let end = start + chunk_size;
         let chunk = &samples_16k[start..end];
         
         println!("Processing chunk {}-{}...", start, end);
-        let out_chunk = pipeline.process(chunk, 0.0)?; // Pitch shift 0
+        let out_chunk = pipeline.process(chunk, hop_size, 0.0)?; // Pitch shift 0
         
         // Log stats
         let max_val = out_chunk.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
