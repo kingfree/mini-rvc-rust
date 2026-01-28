@@ -20,8 +20,9 @@ mod pitch_extractor;
 mod audio_stitching;
 mod realtime_pipeline;
 mod ring_buffer;
+mod rvc_engine;
 
-use realtime_pipeline::RvcPipeline;
+use realtime_pipeline::{RvcPipeline, InferenceBackend};
 
 #[derive(Serialize)]
 struct ExtractionResponse {
@@ -143,8 +144,24 @@ async fn run_server() -> anyhow::Result<()> {
                      if let Some(ref idx) = initial_index {
                          println!("  加载索引: {}", idx);
                      }
+
+                     // Select backend based on features
+                     let backend = if cfg!(feature = "onnxruntime") {
+                         #[cfg(feature = "onnxruntime")]
+                         {
+                             InferenceBackend::OnnxRuntime
+                         }
+                         #[cfg(not(feature = "onnxruntime"))]
+                         {
+                             InferenceBackend::Candle
+                         }
+                     } else {
+                         InferenceBackend::Candle
+                     };
                      
-                     match RvcPipeline::new(content_vec_path, rmvpe_path, &initial_model, initial_index.as_ref(), device.clone()) {
+                     println!("  使用推理后端: {:?} ({})", backend, if matches!(device, Device::Cpu) { "CPU" } else { "Accelerated" });
+
+                     match RvcPipeline::new(content_vec_path, rmvpe_path, &initial_model, initial_index.as_ref(), device.clone(), backend) {
                         Ok(p) => Some(p),
                         Err(e) => {
                             println!("警告: 管道初始化失败: {}", e);
@@ -188,7 +205,21 @@ async fn run_server() -> anyhow::Result<()> {
                     Some(new_model_path) = model_path_rx.recv() => {
                         if let Some(p) = &mut pipeline {
                             println!("Worker: Switching model to {}...", new_model_path);
-                            if let Err(e) = p.set_model(&new_model_path) {
+                            // Select backend based on features
+                            let backend = if cfg!(feature = "onnxruntime") {
+                                #[cfg(feature = "onnxruntime")]
+                                {
+                                    InferenceBackend::OnnxRuntime
+                                }
+                                #[cfg(not(feature = "onnxruntime"))]
+                                {
+                                    InferenceBackend::Candle
+                                }
+                            } else {
+                                InferenceBackend::Candle
+                            };
+
+                            if let Err(e) = p.set_model(&new_model_path, backend) {
                                 eprintln!("Worker: Failed to switch model: {}", e);
                             } else {
                                 // Try to find and load new index
@@ -282,7 +313,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         while let Some(result) = resp_rx.recv().await {
             let output = result.audio_data;
             if !output.is_empty() {
-                let mut out_bytes = Vec::with_capacity(output.len() * 4);
+                let len = output.len();
+                let mut out_bytes = Vec::with_capacity(len * 4);
                 for s in output {
                     out_bytes.extend_from_slice(&s.to_le_bytes());
                 }
@@ -293,7 +325,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 // Send metadata (latency)
                 let meta = serde_json::json!({
                     "latency": result.latency,
-                    "len": output.len()
+                    "len": len
                 });
                 if sender.send(Message::Text(meta.to_string())).await.is_err() {
                     break;

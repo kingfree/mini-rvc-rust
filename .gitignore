@@ -11,3 +11,4 @@ venv_export/
 *.tgz
 *.so
 assets/output.wav
+*.safetensors

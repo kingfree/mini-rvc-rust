@@ -10,23 +10,23 @@ mod pitch_extractor;
 mod audio_stitching;
 mod realtime_pipeline;
 mod ring_buffer;
+mod rvc_engine;
+
+use realtime_pipeline::InferenceBackend;
 
 fn main() -> anyhow::Result<()> {
     println!("--- Full Pipeline Test ---");
-    let device = if candle_core::utils::metal_is_available() {
-        println!("Using Metal");
-        Device::new_metal(0)?
-    } else {
-        println!("Using CPU");
-        Device::Cpu
-    };
 
     let content_vec_path = "pretrain/content_vec_500.onnx";
     let rmvpe_path = "pretrain/rmvpe.onnx";
     let rvc_path = "models/Yukina_v2_merged.onnx";
-    let index_path = Some("models/Yukina_v2_index.safetensors");
+    let index_path: Option<&str> = None; // Disable index for now
 
-    let mut pipeline = RvcPipeline::new(content_vec_path, rmvpe_path, rvc_path, index_path, device)?;
+    // Test Candle CPU
+    println!("\n=== Testing Candle CPU Backend ===");
+    let device_cpu = Device::Cpu;
+    let backend_cpu = InferenceBackend::Candle;
+    let mut pipeline = RvcPipeline::new(content_vec_path, rmvpe_path, rvc_path, index_path, device_cpu, backend_cpu)?;
 
     let input_path = "assets/test.wav";
     let output_path = "assets/output.wav";
